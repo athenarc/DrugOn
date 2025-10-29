@@ -432,103 +432,106 @@ def main():
 
     for m in models_cfg:
         name = m["name"]
-        estimator_path = m["estimator"]
-        fixed_params = m.get("fixed_params", {})
-        numeric_transformers = m.get("numeric_transformers", ["passthrough"])
-
-        # Build a fresh preprocessor (scaler will be replaced by grid search)
-        preprocessor, _, _ = build_preprocessor(X_train, "passthrough")
-
-        # Build pipeline
-        pipe, alias = build_pipeline(preprocessor, estimator_path, fixed_params)
-
-        # Assemble param_grid (includes numeric scalers)
-        grid = m.get("param_grid", {})
-        param_grid = expand_param_grid(grid, numeric_transformers, alias)
-
-        scoring = g.get("scoring", "accuracy")
-        cv = g.get("cv", 5)
-        n_jobs = g.get("n_jobs", -1)
-
-        print(f"\n=== Training {name} ({estimator_path}) ===")
-        gs = GridSearchCV(
-            estimator=pipe,
-            param_grid=param_grid,
-            scoring=scoring,
-            cv=cv,
-            verbose=1,
-            n_jobs=n_jobs,
-        )
-        gs.fit(X_train, y_train)
-
-        best_params = gs.best_params_
-        print(f"Best params for {name}: {best_params}")
-
-        # Rebuild best pipeline explicitly (optional; GridSearchCV.best_estimator_ is okay too)
-        best_pipe = gs.best_estimator_
-        best_pipe.fit(X_train, y_train)
-
-        # Outputs base path per model
-        model_base = Path(outdir) / f"{args.basename}_{name}"
-
-        # Predictions & metrics
-        y_pred = best_pipe.predict(X_test)
-        y_prob = safe_predict_proba_or_score(best_pipe, X_test)
-
-        result = evaluate_classification_metrics(
-            y_all=df[label_col],
-            y_true=y_test,
-            y_pred=y_pred,
-            y_prob=y_prob,
-            analysis_id=1,
-            model_name=name,
-            split_desc=f"{int((1-g.get('test_size',0.2))*100)}/{int(g.get('test_size',0.2)*100)} split"
-        )
-        metrics_dict = dict(result)
-        metrics_rows.append(metrics_dict)
-
-        
-
-        # Feature names after transform
-        feature_names = best_pipe.named_steps["preprocessor"].get_feature_names_out()
-
-        # Prefer your existing importance util; if it fails, use generic fallback
-        importance_df = None
         try:
-            importance_df = get_sorted_feature_importance(best_pipe, feature_names)
-            importance_df = importance_df.rename(columns={importance_df.columns[0]: "feature", importance_df.columns[1]: "importance"})
-            importance_df["method"] = "library_util"
-        except Exception as e:
-            print(f"get_sorted_feature_importance failed for {name}: {e}")
-            importance_df = generic_feature_importance(best_pipe, X_test, y_test, list(feature_names), alias)
+            estimator_path = m["estimator"]
+            fixed_params = m.get("fixed_params", {})
+            numeric_transformers = m.get("numeric_transformers", ["passthrough"])
 
-        # Normalize for cross-model comparability
-        if "importance" in importance_df.columns:
-            total = importance_df["importance"].abs().sum()
-            if total > 0:
-                importance_df["importance_normalized"] = importance_df["importance"].abs() / total
-            else:
-                importance_df["importance_normalized"] = 0.0
+            # Build a fresh preprocessor (scaler will be replaced by grid search)
+            preprocessor, _, _ = build_preprocessor(X_train, "passthrough")
 
-        importance_tables.append((name, importance_df))
+            # Build pipeline
+            pipe, alias = build_pipeline(preprocessor, estimator_path, fixed_params)
 
-        # Save pipeline
-        joblib.dump(best_pipe, f"{model_base}_pipeline.joblib")
+            # Assemble param_grid (includes numeric scalers)
+            grid = m.get("param_grid", {})
+            param_grid = expand_param_grid(grid, numeric_transformers, alias)
 
-        # SHAP explainability
-        try:
-            compute_shap(
-                fitted_pipeline=best_pipe,
-                X_test=X_test,
-                feature_names=list(feature_names),
-                estimator_alias=alias,
-                out_base=model_base,
-                kernel_sample_size=g.get("shap_kernel_sample_size", 200),
-                background_size=g.get("shap_background_size", 100)
+            scoring = g.get("scoring", "accuracy")
+            cv = g.get("cv", 5)
+            n_jobs = g.get("n_jobs", -1)
+
+            print(f"\n=== Training {name} ({estimator_path}) ===")
+            gs = GridSearchCV(
+                estimator=pipe,
+                param_grid=param_grid,
+                scoring=scoring,
+                cv=cv,
+                verbose=1,
+                n_jobs=n_jobs,
             )
-        except Exception as e:
-            print(f"SHAP failed for {name}: {e}")
+            gs.fit(X_train, y_train)
 
+            best_params = gs.best_params_
+            print(f"Best params for {name}: {best_params}")
+
+            # Rebuild best pipeline explicitly (optional; GridSearchCV.best_estimator_ is okay too)
+            best_pipe = gs.best_estimator_
+            best_pipe.fit(X_train, y_train)
+
+            # Outputs base path per model
+            model_base = Path(outdir) / f"{args.basename}_{name}"
+
+            # Predictions & metrics
+            y_pred = best_pipe.predict(X_test)
+            y_prob = safe_predict_proba_or_score(best_pipe, X_test)
+
+            result = evaluate_classification_metrics(
+                y_all=df[label_col],
+                y_true=y_test,
+                y_pred=y_pred,
+                y_prob=y_prob,
+                analysis_id=1,
+                model_name=name,
+                split_desc=f"{int((1-g.get('test_size',0.2))*100)}/{int(g.get('test_size',0.2)*100)} split"
+            )
+            metrics_dict = dict(result)
+            metrics_rows.append(metrics_dict)
+
+            
+
+            # Feature names after transform
+            feature_names = best_pipe.named_steps["preprocessor"].get_feature_names_out()
+
+            # Prefer your existing importance util; if it fails, use generic fallback
+            importance_df = None
+            try:
+                importance_df = get_sorted_feature_importance(best_pipe, feature_names)
+                importance_df = importance_df.rename(columns={importance_df.columns[0]: "feature", importance_df.columns[1]: "importance"})
+                importance_df["method"] = "library_util"
+            except Exception as e:
+                print(f"get_sorted_feature_importance failed for {name}: {e}")
+                importance_df = generic_feature_importance(best_pipe, X_test, y_test, list(feature_names), alias)
+
+            # Normalize for cross-model comparability
+            if "importance" in importance_df.columns:
+                total = importance_df["importance"].abs().sum()
+                if total > 0:
+                    importance_df["importance_normalized"] = importance_df["importance"].abs() / total
+                else:
+                    importance_df["importance_normalized"] = 0.0
+
+            importance_tables.append((name, importance_df))
+
+            # Save pipeline
+            joblib.dump(best_pipe, f"{model_base}_pipeline.joblib")
+
+            # SHAP explainability
+            try:
+                compute_shap(
+                    fitted_pipeline=best_pipe,
+                    X_test=X_test,
+                    feature_names=list(feature_names),
+                    estimator_alias=alias,
+                    out_base=model_base,
+                    kernel_sample_size=g.get("shap_kernel_sample_size", 200),
+                    background_size=g.get("shap_background_size", 100)
+                )
+            except Exception as e:
+                print(f"SHAP failed for {name}: {e}")
+        except Exception as e:
+            print(f"❌ Skipping model '{name}' due to error: {e}")
+            continue
     # ------------------------------
     # Cross-model comparison exports
     # ------------------------------
