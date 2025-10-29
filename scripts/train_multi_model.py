@@ -20,7 +20,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, MinMaxScaler, RobustScaler
 
 # Your utilities
-from evaluation.lib import evaluate_classification_metrics, get_sorted_feature_importance
+from evaluation.lib import save_shap_summary,evaluate_classification_metrics, get_sorted_feature_importance
 
 import joblib
 import warnings
@@ -349,11 +349,23 @@ def compute_shap(
         print(f"Failed to coerce SHAP values to 2-D: {e}")
         return
 
+    
     # ---------- 1) Beeswarm summary ----------
     shap.summary_plot(values, Xt_df, plot_type="dot", show=False)
-    plt.tight_layout()
-    plt.savefig(f"{out_base}_shap_summary.png", dpi=200)
-    plt.close()
+    save_shap_summary(
+    shap_values=values,
+    feature_matrix=Xt_df,   # after your pipeline's preprocessor
+    feature_names=feature_names,
+    out_path=f"{out_base}_shap_summary.png",
+    max_display=20,
+    figsize=(12, 10),
+    dpi=200,
+    left=0.35,   # increase if your labels are even longer
+    right=0.95
+)
+    # plt.tight_layout()
+    # plt.savefig(f"{out_base}_shap_summary.png", dpi=200)
+    # plt.close()
 
     # ---------- 2) SHAP dependence for furosemide ----------
     # feat_t = "num__exposure_furosemide"
