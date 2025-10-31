@@ -1,0 +1,59 @@
+globals:
+  label_col: label
+  test_size: 0.2
+  random_state: 42
+  scoring: accuracy
+  cv: 5
+  n_jobs: -1
+  drop_prefixes: []        # e.g. ["measurement_"]
+  # Sampling for expensive explainers (KernelExplainer); keeps runtime sane
+  shap_kernel_sample_size: 200
+  shap_background_size: 100
+
+models:
+  - name: xgboost
+    estimator: xgboost.XGBClassifier
+    # optional fixed params applied before grid search
+    fixed_params:
+      use_label_encoder: false
+      eval_metric: logloss
+    # choose one or many scalers to search for numerics
+    numeric_transformers: [passthrough,StandardScaler,RobustScaler,MinMaxScaler]
+    param_grid:
+      xgb__n_estimators: [200, 400]
+      xgb__max_depth: [3, 5, 7]
+      xgb__learning_rate: [0.03, 0.1]
+
+  - name: random_forest
+    estimator: sklearn.ensemble.RandomForestClassifier
+    fixed_params: {}
+    numeric_transformers: [passthrough,StandardScaler,RobustScaler,MinMaxScaler]
+    param_grid:
+      rf__n_estimators: [300, 600]
+      rf__max_depth: [null, 10, 20]
+      rf__min_samples_split: [2, 5]
+
+  - name: logistic_regression
+    estimator: sklearn.linear_model.LogisticRegression
+    fixed_params:
+      max_iter: 1000
+      n_jobs: -1
+    numeric_transformers: [passthrough,StandardScaler,RobustScaler,MinMaxScaler]
+    param_grid:
+      lr__C: [0.1, 1.0, 3.0]
+      lr__penalty: ["l2"]
+      lr__solver: ["lbfgs"]
+
+  - name: catboost
+    estimator: catboost.CatBoostClassifier
+    fixed_params:
+      loss_function: Logloss
+      verbose: 0
+      random_state: 42
+    numeric_transformers: [passthrough,StandardScaler,RobustScaler,MinMaxScaler]
+    param_grid:
+      catboost__depth: [4, 6, 8]
+      catboost__learning_rate: [0.03, 0.1]
+      catboost__iterations: [300, 600]
+
+
