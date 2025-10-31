@@ -282,7 +282,7 @@ def main():
     combined = pd.concat([df_pos, df_neg], ignore_index=True)
     # combined = combined.drop_duplicates()
 
-    #combined = sample_per_class(combined, max_per_class=args.max_per_class, seed=args.random_seed)
+    combined = sample_per_class(combined, max_per_class=args.max_per_class, seed=args.random_seed)
 
     base = Path(outdir) / args.basename
     if args.save_format in ("csv"):
