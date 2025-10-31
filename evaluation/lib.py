@@ -18,6 +18,40 @@ from scipy.stats import norm
 from sklearn.inspection import PartialDependenceDisplay
 import matplotlib.pyplot as plt
 
+import matplotlib.pyplot as plt
+import shap
+
+def save_shap_summary(shap_values, feature_matrix, feature_names, out_path,
+                      max_display=20, figsize=(12, 10), dpi=200, left=0.32, right=0.96):
+    """
+    Saves a non-cropped SHAP summary (beeswarm) figure.
+    Works with shap.summary_plot (classic) using matplotlib backend.
+    """
+    plt.close('all')  # start clean
+
+    # Draw without displaying
+    shap.summary_plot(
+        shap_values,
+        features=feature_matrix,
+        feature_names=feature_names,
+        max_display=max_display,
+        show=False  # critical: don't auto-show, we'll control layout & saving
+    )
+
+    fig = plt.gcf()
+    fig.set_size_inches(*figsize)
+    # Give room for long feature names (left) and colorbar (right)
+    plt.subplots_adjust(left=left, right=right, top=0.96, bottom=0.08)
+
+    # Optional: smaller y-label font to reduce truncation risk
+    ax = plt.gca()
+    ax.tick_params(axis='y', labelsize=9)
+
+    # Save with tight bbox and a bit of padding so nothing clips
+    fig.savefig(out_path, dpi=dpi, bbox_inches='tight', pad_inches=0.3, facecolor='white')
+    plt.close(fig)
+
+
 def plot_pdp_all_features(model_pipeline, X, feature_names=None):
     """
     Plots Partial Dependence Plots (PDPs) for all features using a fitted pipeline.
