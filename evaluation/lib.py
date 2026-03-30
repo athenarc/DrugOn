@@ -126,6 +126,26 @@ def get_sorted_feature_importance(pipeline, feature_names):
     return importance_df
 
 
+def select_threshold_max_balanced_accuracy(y_true: pd.Series, y_prob: np.ndarray) -> float:
+    """
+    Pick threshold that maximizes balanced accuracy on provided (y_true, y_prob).
+    Leakage-safe if you pass ONLY training data.
+    """
+    thresholds = np.linspace(0.01, 0.99, 199)  # step 0.005
+    best_t = 0.5
+    best_score = -np.inf
+
+    y_true_arr = np.asarray(y_true, dtype=int)
+
+    for t in thresholds:
+        y_pred_t = (y_prob >= t).astype(int)
+        score = balanced_accuracy_score(y_true_arr, y_pred_t)
+        print(f"Threshold: {t:.3f}, Balanced Accuracy: {score:.4f}")
+        if score > best_score:
+            best_score = score
+            best_t = float(t)
+
+    return best_t
 
 def evaluate_classification_metrics(y_all,y_true, y_pred, y_prob, analysis_id=1, ratio=1, model_name="XGBoost", split_desc='80/20'):
     """
@@ -193,3 +213,40 @@ def evaluate_classification_metrics(y_all,y_true, y_pred, y_prob, analysis_id=1,
         'Type 2 Error (FNR)': type2
     }
     return result
+
+def plot_auc_k(df: pd.DataFrame, feature_col: str):
+  auc_col = [c for c in df.columns if "auc" in c.lower()][0]
+
+  # ----------------------------
+  # Aggregate AUC by feature count
+  # ----------------------------
+  agg = (
+      df.groupby("k")[feature_col]
+        .mean()
+        .reset_index()
+        .sort_values("k")
+  )
+
+  # ----------------------------
+  # Elbow detection (within 1% of max AUC)
+  # ----------------------------
+  max_auc = agg[feature_col].max()
+  best_k = agg.loc[agg[feature_col].idxmax()]['k']
+
+  print(f"Max AUC: {max_auc:.4f}")
+
+  # ----------------------------
+  # Plot
+  # ----------------------------
+  plt.figure(figsize=(8, 5))
+  plt.plot(agg["k"], agg[feature_col], marker="o", linewidth=2)
+  plt.axhline(max_auc, linestyle="--", label=f"Max {feature_col} = {max_auc:.3f}")
+  plt.axvline(best_k, linestyle="-.", label=f"Best k = {best_k}",color='red')
+
+  plt.xlabel("Number of Features (k)")
+  plt.ylabel(f"Mean {feature_col}")
+  plt.title(f"{feature_col} vs Number of Features Curve")
+  plt.legend()
+  plt.grid(alpha=0.3)
+  plt.tight_layout()
+  plt.show()

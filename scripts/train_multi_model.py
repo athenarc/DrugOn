@@ -15,12 +15,12 @@ import pandas as pd
 
 from sklearn.compose import ColumnTransformer
 from sklearn.inspection import permutation_importance
-from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, MinMaxScaler, RobustScaler
 
 # Your utilities
-from evaluation.lib import save_shap_summary,evaluate_classification_metrics, get_sorted_feature_importance
+from evaluation.lib import save_shap_summary,evaluate_classification_metrics, get_sorted_feature_importance,select_threshold_max_balanced_accuracy
 
 import joblib
 import warnings
@@ -314,8 +314,10 @@ def compute_shap(
     try:
         expl = shap.TreeExplainer(est)
         explanation_or_values = expl(Xt_df)
+        
     except Exception:
         try:
+            print("Using LinearExplainer for SHAP values...")
             expl = shap.LinearExplainer(est, Xt_df, feature_perturbation="interventional")
             explanation_or_values = expl(Xt_df)
         except Exception:
@@ -348,7 +350,28 @@ def compute_shap(
     except Exception as e:
         print(f"Failed to coerce SHAP values to 2-D: {e}")
         return
+    try:
+        assert values.shape[1] == len(feature_names)
 
+        mean_abs = np.mean(np.abs(values), axis=0)
+
+        shap_importance = (
+            pd.DataFrame({
+                "feature": feature_names,
+                "mean_abs_shap": mean_abs,
+            })
+            .sort_values("mean_abs_shap", ascending=False)
+            .reset_index(drop=True)
+        )
+
+        shap_importance["rank"] = np.arange(1, len(shap_importance) + 1)
+
+        out_csv = Path(f"{out_base}_shap_importance.csv")
+        shap_importance.to_csv(out_csv, index=False)
+
+    except Exception as e:
+        print(f"Failed to save SHAP importance table: {e}")
+    
     
     # ---------- 1) Beeswarm summary ----------
     shap.summary_plot(values, Xt_df, plot_type="dot", show=False)
@@ -410,13 +433,15 @@ def main():
     # ------------------------------
     # Load data
     # ------------------------------
-    df = pd.read_csv(args.data, index_col=0)
+    df = pd.read_csv(args.data  )
+    print(df.columns)
     g = cfg.get("globals", {})
     label_col = g.get("label_col", "label")
     if label_col not in df.columns:
         raise KeyError(f"Label column '{label_col}' not found in data.")
 
     df = drop_by_prefix(df, g.get("drop_prefixes", []))
+    # df = df.drop(columns=['race','gender','person_id'])
 
     y = df[label_col]
     X = df.drop(columns=[label_col])
@@ -447,6 +472,12 @@ def main():
         try:
             estimator_path = m["estimator"]
             fixed_params = m.get("fixed_params", {})
+            if estimator_path == "xgboost.XGBClassifier" or estimator_path == "catboost.CatBoostClassifier" and "scale_pos_weight" in fixed_params:
+                neg = (y_train == 0).sum()
+                pos = (y_train == 1).sum()
+                best_spw = neg / pos
+                fixed_params["scale_pos_weight"] = best_spw
+            #print(fixed_params["scale_pos_weight"])
             numeric_transformers = m.get("numeric_transformers", ["passthrough"])
 
             # Build a fresh preprocessor (scaler will be replaced by grid search)
@@ -464,11 +495,17 @@ def main():
             n_jobs = g.get("n_jobs", -1)
 
             print(f"\n=== Training {name} ({estimator_path}) ===")
+            print(fixed_params)
+            skf = StratifiedKFold(
+                n_splits=cv,
+                shuffle=True,
+                random_state=42
+                )
             gs = GridSearchCV(
                 estimator=pipe,
                 param_grid=param_grid,
                 scoring=scoring,
-                cv=cv,
+                cv=skf,
                 verbose=1,
                 n_jobs=n_jobs,
             )
@@ -477,8 +514,11 @@ def main():
             best_params = gs.best_params_
             print(f"Best params for {name}: {best_params}")
 
+
             # Rebuild best pipeline explicitly (optional; GridSearchCV.best_estimator_ is okay too)
             best_pipe = gs.best_estimator_
+            print(best_pipe.named_steps[alias].get_params())
+
             best_pipe.fit(X_train, y_train)
 
             # Outputs base path per model
@@ -487,6 +527,7 @@ def main():
             # Predictions & metrics
             y_pred = best_pipe.predict(X_test)
             y_prob = safe_predict_proba_or_score(best_pipe, X_test)
+
 
             result = evaluate_classification_metrics(
                 y_all=df[label_col],

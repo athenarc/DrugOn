@@ -5,6 +5,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 from features.sqltranslate import *
+
 def build_exposure_outcome_dataset(
     duckdb_conn,
     exposures: List[int],
@@ -126,7 +127,6 @@ def build_exposure_outcome_dataset(
     return query
 
 
-import pandas as pd
 
 def engineer_ade_features(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -171,7 +171,6 @@ def engineer_ade_features(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-import pandas as pd
 
 def map_concept_ids_to_names(df: pd.DataFrame, duckdb_conn,dialect
 ) -> pd.DataFrame:
@@ -216,43 +215,77 @@ def map_concept_ids_to_names(df: pd.DataFrame, duckdb_conn,dialect
 
     return df
 
+def get_top_concept_ids(
+    con,
+    outcome_id: Union[int, str],
+    time_window_days: int = 365,
+    num_exposures: int = 10,
+    num_measurements: int = 10,
+    num_procedures: int = 5,
+    source_schema: str = 'main',
+    result_schema: str = 'main',
+    dialect: str = 'duckdb',
+):
+    """
+    Discover top exposures/measurements/procedures associated with an outcome.
 
-# Step 1: Extract top concept IDs for each domain from the database
-def get_top_concept_ids(con, outcome_id: int, 
-                        time_window_days: int = 365, 
-                        num_exposures: int = 10, 
-                        num_measurements: int = 10, 
-                        num_procedures: int = 5,
-                        source_schema = 'main',
-                        dialect = 'duckdb'):
-    print(dialect)
-    top_exposures = (f"""
-        WITH outcome_patients AS (
+    - If outcome_id is an INT  -> use condition_occurrence (known-outcome mode).
+    - If outcome_id == 'predefined' -> use result_schema.outcome_patients
+      (threshold mode: cohort already built in run_threshold_mode).
+
+    In threshold mode we also DROP creatinine (3016723) from discovered
+    measurements to avoid label leakage.
+    """
+
+    # -------------------------
+    # 0) Build outcome_patients CTE depending on mode
+    # -------------------------
+    if outcome_id == "predefined":
+        # Threshold mode: outcome_patients already persisted
+        outcome_cte = f"""
+        outcome_patients AS (
+            SELECT person_id, condition_start_date
+            FROM {result_schema}.outcome_patients
+        )
+        """
+    else:
+        # Known outcome mode: pull directly from condition_occurrence
+        outcome_cte = f"""
+        outcome_patients AS (
             SELECT person_id, condition_start_date
             FROM {source_schema}.condition_occurrence
             WHERE condition_concept_id = {outcome_id}
         )
-        SELECT d.drug_concept_id, COUNT(*) as freq
+        """
+
+    # -------------------------
+    # 1) Top EXPOSURES
+    # -------------------------
+    print("Getting top exposures...")
+    top_exposures_sql = f"""
+        WITH
+        {outcome_cte}
+        SELECT d.drug_concept_id, COUNT(*) AS freq
         FROM {source_schema}.drug_era d
         JOIN outcome_patients o ON d.person_id = o.person_id
         WHERE d.drug_era_end_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
-          AND d.drug_era_start_date <= o.condition_start_date
+          AND d.drug_era_start_date <  o.condition_start_date
         GROUP BY d.drug_concept_id
         ORDER BY freq DESC
         LIMIT {num_exposures}
-    """)
-    sql = qualify_tables(top_exposures, source_schema=source_schema)
+    """
+    sql = qualify_tables(top_exposures_sql, source_schema=source_schema)
     sql = translate_sql(sql, dialect=dialect)
-    print(sql)
     top_exposures = fetch_df(con, sql, dialect=dialect)["drug_concept_id"].tolist()
 
-    top_measurements = (f"""
-        WITH outcome_patients AS (
-            SELECT person_id, condition_start_date
-            FROM {source_schema}.condition_occurrence
-            WHERE condition_concept_id = {outcome_id}
-        )
-        SELECT m.measurement_concept_id, COUNT(*) as freq
+    # -------------------------
+    # 2) Top MEASUREMENTS
+    # -------------------------
+    print("Getting top measurements...")
+    top_measurements_sql = f"""
+        WITH
+        {outcome_cte}
+        SELECT m.measurement_concept_id, COUNT(*) AS freq
         FROM {source_schema}.measurement m
         JOIN outcome_patients o ON m.person_id = o.person_id
         WHERE m.measurement_date BETWEEN (o.condition_start_date - INTERVAL {time_window_days} DAY)
@@ -260,18 +293,24 @@ def get_top_concept_ids(con, outcome_id: int,
         GROUP BY m.measurement_concept_id
         ORDER BY freq DESC
         LIMIT {num_measurements}
-    """)
-    sql = qualify_tables(top_measurements, source_schema=source_schema)
+    """
+    sql = qualify_tables(top_measurements_sql, source_schema=source_schema)
     sql = translate_sql(sql, dialect=dialect)
     top_measurements = fetch_df(con, sql, dialect=dialect)["measurement_concept_id"].tolist()
 
-    top_procedures = (f"""
-        WITH outcome_patients AS (
-            SELECT person_id, condition_start_date
-            FROM {source_schema}.condition_occurrence
-            WHERE condition_concept_id = {outcome_id}
-        )
-        SELECT p.procedure_concept_id, COUNT(*) as freq
+    # In threshold mode, drop creatinine from discovered measurements to avoid leakage
+    CREATININE_CONCEPT_ID = 3016723
+    if outcome_id == "predefined":
+        top_measurements = [cid for cid in top_measurements if cid != CREATININE_CONCEPT_ID]
+
+    # -------------------------
+    # 3) Top PROCEDURES
+    # -------------------------
+    print("Getting top procedures...")
+    top_procedures_sql = f"""
+        WITH
+        {outcome_cte}
+        SELECT p.procedure_concept_id, COUNT(*) AS freq
         FROM {source_schema}.procedure_occurrence p
         JOIN outcome_patients o ON p.person_id = o.person_id
         WHERE p.procedure_date BETWEEN (o.condition_start_date - INTERVAL {time_window_days} DAY)
@@ -279,135 +318,368 @@ def get_top_concept_ids(con, outcome_id: int,
         GROUP BY p.procedure_concept_id
         ORDER BY freq DESC
         LIMIT {num_procedures}
-    """)
-    sql = qualify_tables(top_procedures, source_schema=source_schema)
+    """
+    sql = qualify_tables(top_procedures_sql, source_schema=source_schema)
     sql = translate_sql(sql, dialect=dialect)
     top_procedures = fetch_df(con, sql, dialect=dialect)["procedure_concept_id"].tolist()
+    print("Discovered top concept IDs.")
 
     return top_exposures, top_measurements, top_procedures
 
+# def build_feature_query_from_concept_ids(
+#     top_exposures: Optional[List[int]] = None,
+#     top_measurements: Optional[List[int]] = None,
+#     top_procedures: Optional[List[int]] = None,
+#     extra_conditions: Optional[List[int]] = None,
+#     outcome_id: Union[int, str] = 'predefined',
+#     time_window_days: int = 365,
+#     source_schema: str = 'main',
+#     result_schema: str = 'main',
+#     dialect: str = 'duckdb',
+# ) -> str:
+#     """
+#     Generate a SQL query to extract patient-level features for a specific outcome.
+#     Optional: exposures, measurements, procedures, and extra conditions.
+#     """
 
+#     # ---- 1) Optional: remove creatinine from features in threshold mode ----
+#     # Adjust 3016723 to your actual creatinine concept_id if different.
+#     CREATININE_CONCEPT_ID = 3016723
+#     if outcome_id == 'predefined' and top_measurements:
+#         top_measurements = [
+#             cid for cid in top_measurements
+#             if cid != CREATININE_CONCEPT_ID
+#         ]
+
+#     ctes = []
+
+#     # Outcome CTE
+#     if outcome_id == 'predefined':
+#         outcome_cte = f"""
+#         outcome_patients AS (
+#             SELECT person_id, condition_start_date, condition_concept_id
+#             FROM {result_schema}.outcome_patients
+#         )
+#         """
+#     else:
+#         outcome_cte = f"""
+#         outcome_patients AS (
+#             SELECT person_id, condition_start_date, condition_concept_id
+#             FROM {source_schema}.condition_occurrence
+#             WHERE condition_concept_id = {outcome_id}
+#         )
+#         """
+#     ctes.append(outcome_cte)
+
+#     feature_selects = []
+
+#     # Exposure CTE and selects
+#     if top_exposures:
+#         ctes.append(f"""
+#         exposure_features AS (
+#             SELECT o.person_id, o.condition_start_date, d.drug_concept_id
+#             FROM outcome_patients o
+#             JOIN {source_schema}.drug_era d ON d.person_id = o.person_id
+#             WHERE d.drug_era_end_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
+#               AND d.drug_era_start_date <  o.condition_start_date              -- STRICT <
+#               AND d.drug_concept_id IN ({','.join(map(str, top_exposures))})
+#         )
+#         """)
+#         feature_selects.extend([
+#             f"MAX(CASE WHEN ef.drug_concept_id = {cid} THEN 1 ELSE 0 END) AS exposure_{cid}"
+#             for cid in top_exposures
+#         ])
+    
+#     # Measurement CTE and selects
+#     if top_measurements:
+#         ctes.append(f"""
+#             measurement_features AS (
+#                 SELECT
+#                     o.person_id,
+#                     o.condition_start_date,
+#                     m.measurement_concept_id,
+#                     m.value_as_number,
+#                     ROW_NUMBER() OVER (
+#                         PARTITION BY o.person_id, m.measurement_concept_id
+#                         ORDER BY m.measurement_date DESC   -- latest measurement before event
+#                     ) AS rn
+#                 FROM outcome_patients o
+#                 JOIN {source_schema}.measurement m
+#                 ON m.person_id = o.person_id
+#                 WHERE m.measurement_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
+#                 AND m.measurement_date <  o.condition_start_date
+#                 AND m.measurement_concept_id IN ({','.join(map(str, top_measurements))})
+#             )
+#         """)
+#         feature_selects.extend([
+#             f"MAX(CASE WHEN mf.measurement_concept_id = {cid} AND mf.rn = 1 THEN mf.value_as_number ELSE NULL END) AS measurement_{cid}"
+#             for cid in top_measurements
+#         ])
+
+#     # Procedure CTE and selects
+#     if top_procedures:
+#         ctes.append(f"""
+#         procedure_features AS (
+#             SELECT o.person_id, o.condition_start_date, p.procedure_concept_id
+#             FROM {source_schema}.procedure_occurrence p
+#             JOIN outcome_patients o ON p.person_id = o.person_id
+#             WHERE p.procedure_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
+#               AND p.procedure_date <  o.condition_start_date               -- STRICT <
+#               AND p.procedure_concept_id IN ({','.join(map(str, top_procedures))})
+#         )
+#         """)
+#         feature_selects.extend([
+#             f"MAX(CASE WHEN pf.procedure_concept_id = {cid} THEN 1 ELSE 0 END) AS procedure_{cid}"
+#             for cid in top_procedures
+#         ])
+
+#     # Extra condition CTE and selects
+#     if extra_conditions:
+#         ctes.append(f"""
+#         condition_features AS (
+#             SELECT o.person_id, o.condition_start_date, c.condition_concept_id
+#             FROM {source_schema}.condition_occurrence c
+#             JOIN outcome_patients o ON c.person_id = o.person_id
+#             WHERE c.condition_start_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
+#               AND c.condition_start_date <  o.condition_start_date          -- STRICT <
+#               AND c.condition_concept_id IN ({','.join(map(str, extra_conditions))})
+#         )
+#         """)
+#         feature_selects.extend([
+#             f"MAX(CASE WHEN cf.condition_concept_id = {cid} THEN 1 ELSE 0 END) AS condition_{cid}"
+#             for cid in extra_conditions
+#         ])
+
+#     # Final features CTE
+#     joins = []
+#     if top_exposures:
+#         joins.append("LEFT JOIN exposure_features ef ON o.person_id = ef.person_id AND o.condition_start_date = ef.condition_start_date")
+#     if top_measurements:
+#         joins.append("LEFT JOIN measurement_features mf ON o.person_id = mf.person_id AND o.condition_start_date = mf.condition_start_date")
+#     if top_procedures:
+#         joins.append("LEFT JOIN procedure_features pf ON o.person_id = pf.person_id AND o.condition_start_date = pf.condition_start_date")
+#     if extra_conditions:
+#         joins.append("LEFT JOIN condition_features cf ON o.person_id = cf.person_id AND o.condition_start_date = cf.condition_start_date")
+
+#     ctes.append(f"""
+#     final_features AS (
+#         SELECT
+#             o.person_id,
+#             o.condition_start_date,
+#             o.condition_concept_id,
+#             p.gender_concept_id,
+#             p.race_concept_id,
+#             YEAR(o.condition_start_date) - p.year_of_birth AS age_at_outcome
+#             {',' if feature_selects else ''}{', '.join(feature_selects)}
+#         FROM outcome_patients o
+#         JOIN person p ON o.person_id = p.person_id
+#         {' '.join(joins)}
+#         GROUP BY o.person_id, o.condition_start_date,
+#                  o.condition_concept_id, p.gender_concept_id, p.race_concept_id, p.year_of_birth
+#     )
+#     """)
+#     with_clause = ',\n'.join(ctes)
+#     query = f"""
+#     WITH
+#     {with_clause}
+#     SELECT * FROM final_features;
+#     """
+#     sql = qualify_tables(query, source_schema=source_schema)
+#     sql = translate_sql(sql, dialect=dialect)
+#     return sql
+
+# the above commented out function is the old version. 
+# The new version below adds 4 dense burden features and ensures all joins are on both person_id 
+# and condition_start_date to prevent leakage.
 def build_feature_query_from_concept_ids(
     top_exposures: Optional[List[int]] = None,
     top_measurements: Optional[List[int]] = None,
     top_procedures: Optional[List[int]] = None,
     extra_conditions: Optional[List[int]] = None,
-    outcome_id: Union[int, str] = 'predefined',
+    outcome_id: Union[int, str] = "predefined",  # "predefined" or an int
     time_window_days: int = 365,
-    source_schema: str = 'main',
-    result_schema: str = 'main',
-    dialect: str = 'duckdb',   
+    source_schema: str = "main",
+    result_schema: str = "main",
+    dialect: str = "duckdb",
 ) -> str:
     """
-    Generate a SQL query to extract patient-level features for a specific outcome.
-    Optional: exposures, measurements, procedures, and extra conditions.
+    POSITIVES (and known-outcome positives):
+    - Anchors on outcome_patients.condition_start_date (index date).
+    - Builds binary features for selected exposures/procedures/conditions.
+    - Builds continuous features for selected measurements (latest value pre-index).
+    - Adds 4 dense burden features:
+        visit_count, distinct_drug_count, distinct_condition_count, days_observed_before_index
     """
 
-    ctes = []
+    # Prevent leakage in threshold mode (predefined outcome built from creatinine)
+    CREATININE_CONCEPT_ID = 3016723
+    if outcome_id == "predefined" and top_measurements:
+        top_measurements = [cid for cid in top_measurements if cid != CREATININE_CONCEPT_ID]
+
+    ctes: List[str] = []
 
     # Outcome CTE
-    if outcome_id == 'predefined':
-        outcome_cte = f"""
+    if outcome_id == "predefined":
+        ctes.append(f"""
         outcome_patients AS (
             SELECT person_id, condition_start_date, condition_concept_id
             FROM {result_schema}.outcome_patients
         )
-        """
+        """)
     else:
-        outcome_cte = f"""
+        ctes.append(f"""
         outcome_patients AS (
-            SELECT person_id, condition_start_date, condition_concept_id
-            FROM {source_schema}.condition_occurrence
+            SELECT
+                person_id,
+                MIN(condition_start_date) AS condition_start_date,
+                {outcome_id} AS condition_concept_id
+            FROM main.condition_occurrence
             WHERE condition_concept_id = {outcome_id}
-        )
-        """
-    ctes.append(outcome_cte)
+            GROUP BY person_id
+            )
+        """)
 
-    feature_selects = []
+    # 4 dense burden features
+    ctes.append(f"""
+    burden_features AS (
+        SELECT
+            o.person_id,
+            o.condition_start_date,
+            COUNT(DISTINCT v.visit_occurrence_id) AS visit_count,
+            COUNT(DISTINCT d.drug_concept_id) AS distinct_drug_count,
+            COUNT(DISTINCT c.condition_concept_id) AS distinct_condition_count
+        FROM outcome_patients o
+        LEFT JOIN {source_schema}.visit_occurrence v
+          ON v.person_id = o.person_id
+         AND v.visit_start_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
+         AND v.visit_start_date <  o.condition_start_date
+        LEFT JOIN {source_schema}.drug_era d
+          ON d.person_id = o.person_id
+         AND d.drug_era_end_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
+         AND d.drug_era_start_date <  o.condition_start_date
+        LEFT JOIN {source_schema}.condition_occurrence c
+          ON c.person_id = o.person_id
+         AND c.condition_start_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
+         AND c.condition_start_date <  o.condition_start_date
+        GROUP BY o.person_id, o.condition_start_date
+    )
+    """)
 
-    # Exposure CTE and selects
+    ctes.append(f"""
+    observation_depth AS (
+        SELECT
+            o.person_id,
+            o.condition_start_date,
+            MAX(DATE_DIFF('day', op.observation_period_start_date, o.condition_start_date)) AS days_observed_before_index
+        FROM outcome_patients o
+        LEFT JOIN {source_schema}.observation_period op
+          ON op.person_id = o.person_id
+         AND o.condition_start_date BETWEEN op.observation_period_start_date AND op.observation_period_end_date
+        GROUP BY o.person_id, o.condition_start_date
+    )
+    """)
+
+    feature_selects: List[str] = []
+    joins: List[str] = []
+
+    # Exposure features (binary)
     if top_exposures:
         ctes.append(f"""
         exposure_features AS (
             SELECT o.person_id, o.condition_start_date, d.drug_concept_id
             FROM outcome_patients o
-            JOIN drug_era d ON d.person_id = o.person_id
+            JOIN {source_schema}.drug_era d
+              ON d.person_id = o.person_id
             WHERE d.drug_era_end_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
-              AND d.drug_era_start_date <= o.condition_start_date
-              AND d.drug_concept_id IN ({','.join(map(str, top_exposures))})
+              AND d.drug_era_start_date <  o.condition_start_date
+              AND d.drug_concept_id IN ({",".join(map(str, top_exposures))})
         )
         """)
         feature_selects.extend([
             f"MAX(CASE WHEN ef.drug_concept_id = {cid} THEN 1 ELSE 0 END) AS exposure_{cid}"
             for cid in top_exposures
         ])
+        joins.append(
+            "LEFT JOIN exposure_features ef "
+            "ON o.person_id = ef.person_id AND o.condition_start_date = ef.condition_start_date"
+        )
 
-    # Measurement CTE and selects
+    # Measurement features (continuous: latest value pre-index)
     if top_measurements:
         ctes.append(f"""
         measurement_features AS (
-            SELECT m.person_id, m.measurement_concept_id, m.value_as_number, o.condition_start_date,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY m.person_id, m.measurement_concept_id
-                       ORDER BY ABS(DATE_DIFF('day', m.measurement_date, o.condition_start_date))
-                   ) AS rn
-            FROM {source_schema}.measurement m
-            JOIN outcome_patients o ON m.person_id = o.person_id
-            WHERE m.measurement_date BETWEEN (o.condition_start_date - INTERVAL {time_window_days} DAY)
-                                         AND o.condition_start_date
-              AND m.measurement_concept_id IN ({','.join(map(str, top_measurements))})
+            SELECT
+                o.person_id,
+                o.condition_start_date,
+                m.measurement_concept_id,
+                m.value_as_number,
+                ROW_NUMBER() OVER (
+                    PARTITION BY o.person_id, m.measurement_concept_id
+                    ORDER BY m.measurement_date DESC
+                ) AS rn
+            FROM outcome_patients o
+            JOIN {source_schema}.measurement m
+              ON m.person_id = o.person_id
+            WHERE m.measurement_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
+              AND m.measurement_date <  o.condition_start_date
+              AND m.measurement_concept_id IN ({",".join(map(str, top_measurements))})
         )
         """)
         feature_selects.extend([
-            f"MAX(CASE WHEN mf.measurement_concept_id = {cid} AND mf.rn = 1 THEN mf.value_as_number ELSE NULL END) AS measurement_{cid}"
+            f"MAX(CASE WHEN mf.measurement_concept_id = {cid} AND mf.rn = 1 "
+            f"THEN mf.value_as_number ELSE NULL END) AS measurement_{cid}"
             for cid in top_measurements
         ])
+        joins.append(
+            "LEFT JOIN measurement_features mf "
+            "ON o.person_id = mf.person_id AND o.condition_start_date = mf.condition_start_date"
+        )
 
-    # Procedure CTE and selects
+    # Procedure features (binary)
     if top_procedures:
         ctes.append(f"""
         procedure_features AS (
             SELECT o.person_id, o.condition_start_date, p.procedure_concept_id
-            FROM {source_schema}.procedure_occurrence p
-            JOIN outcome_patients o ON p.person_id = o.person_id
-            WHERE p.procedure_date BETWEEN (o.condition_start_date - INTERVAL {time_window_days} DAY)
-                                       AND o.condition_start_date
-              AND p.procedure_concept_id IN ({','.join(map(str, top_procedures))})
+            FROM outcome_patients o
+            JOIN {source_schema}.procedure_occurrence p
+              ON p.person_id = o.person_id
+            WHERE p.procedure_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
+              AND p.procedure_date <  o.condition_start_date
+              AND p.procedure_concept_id IN ({",".join(map(str, top_procedures))})
         )
         """)
         feature_selects.extend([
             f"MAX(CASE WHEN pf.procedure_concept_id = {cid} THEN 1 ELSE 0 END) AS procedure_{cid}"
             for cid in top_procedures
         ])
+        joins.append(
+            "LEFT JOIN procedure_features pf "
+            "ON o.person_id = pf.person_id AND o.condition_start_date = pf.condition_start_date"
+        )
 
-    # Extra condition CTE and selects
+    # Extra condition features (binary)
     if extra_conditions:
         ctes.append(f"""
         condition_features AS (
             SELECT o.person_id, o.condition_start_date, c.condition_concept_id
-            FROM {source_schema}.condition_occurrence c
-            JOIN outcome_patients o ON c.person_id = o.person_id
-            WHERE c.condition_start_date BETWEEN (o.condition_start_date - INTERVAL {time_window_days} DAY)
-                                             AND o.condition_start_date
-              AND c.condition_concept_id IN ({','.join(map(str, extra_conditions))})
+            FROM outcome_patients o
+            JOIN {source_schema}.condition_occurrence c
+              ON c.person_id = o.person_id
+            WHERE c.condition_start_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
+              AND c.condition_start_date <  o.condition_start_date
+              AND c.condition_concept_id IN ({",".join(map(str, extra_conditions))})
         )
         """)
         feature_selects.extend([
             f"MAX(CASE WHEN cf.condition_concept_id = {cid} THEN 1 ELSE 0 END) AS condition_{cid}"
             for cid in extra_conditions
         ])
+        joins.append(
+            "LEFT JOIN condition_features cf "
+            "ON o.person_id = cf.person_id AND o.condition_start_date = cf.condition_start_date"
+        )
 
-    # Final features CTE
-    joins = []
-    if top_exposures:
-        joins.append("LEFT JOIN exposure_features ef ON o.person_id = ef.person_id AND o.condition_start_date = ef.condition_start_date")
-    if top_measurements:
-        joins.append("LEFT JOIN measurement_features mf ON o.person_id = mf.person_id AND o.condition_start_date = mf.condition_start_date")
-    if top_procedures:
-        joins.append("LEFT JOIN procedure_features pf ON o.person_id = pf.person_id AND o.condition_start_date = pf.condition_start_date")
-    if extra_conditions:
-        joins.append("LEFT JOIN condition_features cf ON o.person_id = cf.person_id AND o.condition_start_date = cf.condition_start_date")
-
+    # Final
     ctes.append(f"""
     final_features AS (
         SELECT
@@ -416,109 +688,36 @@ def build_feature_query_from_concept_ids(
             o.condition_concept_id,
             p.gender_concept_id,
             p.race_concept_id,
-            YEAR(o.condition_start_date) - p.year_of_birth AS age_at_outcome
-            {',' if feature_selects else ''}{', '.join(feature_selects)}
+            YEAR(o.condition_start_date) - p.year_of_birth AS age_at_outcome,
+
+            COALESCE(b.visit_count, 0) AS visit_count,
+            COALESCE(b.distinct_drug_count, 0) AS distinct_drug_count,
+            COALESCE(b.distinct_condition_count, 0) AS distinct_condition_count,
+            COALESCE(od.days_observed_before_index, 0) AS days_observed_before_index
+            {"," if feature_selects else ""}{", ".join(feature_selects)}
+
         FROM outcome_patients o
-        JOIN person p ON o.person_id = p.person_id
-        {' '.join(joins)}
-        GROUP BY o.person_id, o.condition_start_date,
-                 o.condition_concept_id, p.gender_concept_id, p.race_concept_id, p.year_of_birth
+        JOIN {source_schema}.person p
+          ON p.person_id = o.person_id
+
+        LEFT JOIN burden_features b
+          ON o.person_id = b.person_id AND o.condition_start_date = b.condition_start_date
+        LEFT JOIN observation_depth od
+          ON o.person_id = od.person_id AND o.condition_start_date = od.condition_start_date
+
+        {" ".join(joins)}
+        GROUP BY
+            o.person_id, o.condition_start_date, o.condition_concept_id,
+            p.gender_concept_id, p.race_concept_id, p.year_of_birth,
+            b.visit_count, b.distinct_drug_count, b.distinct_condition_count,
+            od.days_observed_before_index
     )
     """)
-    with_clause = ',\n'.join(ctes)
-    query = f"""
-    WITH
-    {with_clause}
-    SELECT * FROM final_features;
-    """
+
+    query = f"WITH {', '.join(ctes)} SELECT * FROM final_features;"
     sql = qualify_tables(query, source_schema=source_schema)
     sql = translate_sql(sql, dialect=dialect)
     return sql
-
-def build_negative_patient_query(
-    top_exposures: List[int],
-    top_measurements: List[int],
-    top_procedures: List[int],
-    outcome_id: int,
-    time_window_days: int = 365,
-
-) -> str:
-    """
-    Generates SQL to extract negative (label=0) patients who did NOT have the outcome
-    and were observed for at least min_observation_days.
-    Drug, measurement, and procedure features are populated based on whether they occurred
-    at any time during the patient's observation period.
-    """
-
-    exposure_cols = ',\n'.join([
-        f"MAX(CASE WHEN d.drug_concept_id = {cid} THEN 1 ELSE 0 END) AS exposure_{cid}"
-        for cid in top_exposures
-    ])
-    measurement_cols = ',\n'.join([
-        f"MAX(CASE WHEN m.measurement_concept_id = {cid} AND m.rn = 1 THEN m.value_as_number ELSE NULL END) AS measurement_{cid}"
-        for cid in top_measurements
-    ])
-    procedure_cols = ',\n'.join([
-        f"MAX(CASE WHEN proc.procedure_concept_id = {cid} THEN 1 ELSE 0 END) AS procedure_{cid}"
-        for cid in top_procedures
-    ])
-
-    query = f"""
-    WITH eligible_patients AS (
-        SELECT person_id,
-               observation_period_start_date,
-               observation_period_end_date
-        FROM observation_period
-        WHERE DATE_DIFF('day', observation_period_start_date, observation_period_end_date) >= {time_window_days}
-    ),
-    no_outcome_patients AS (
-        SELECT e.*
-        FROM eligible_patients e
-        LEFT JOIN condition_occurrence c ON e.person_id = c.person_id AND c.condition_concept_id = {outcome_id}
-        WHERE c.person_id IS NULL
-    ),
-    exposure_features AS (
-        SELECT d.person_id, d.drug_concept_id
-        FROM drug_era d
-        JOIN no_outcome_patients n ON d.person_id = n.person_id
-        WHERE d.drug_concept_id IN ({','.join(map(str, top_exposures))})
-    ),
-    measurement_features AS (
-        SELECT m.person_id, m.measurement_concept_id, m.value_as_number,
-               ROW_NUMBER() OVER (
-                   PARTITION BY m.person_id, m.measurement_concept_id
-                   ORDER BY m.measurement_date DESC
-               ) AS rn
-        FROM measurement m
-        JOIN no_outcome_patients n ON m.person_id = n.person_id
-        WHERE m.measurement_concept_id IN ({','.join(map(str, top_measurements))})
-    ),
-    procedure_features AS (
-        SELECT proc.person_id, proc.procedure_concept_id
-        FROM procedure_occurrence proc
-        JOIN no_outcome_patients n ON proc.person_id = n.person_id
-        WHERE proc.procedure_concept_id IN ({','.join(map(str, top_procedures))})
-    ),
-    final_features AS (
-        SELECT n.person_id,
-               observation_period_end_date AS condition_start_date,
-               {outcome_id} AS condition_concept_id,
-               p.gender_concept_id,
-               p.race_concept_id,
-               YEAR(observation_period_end_date) - p.year_of_birth AS age_at_outcome,
-               {exposure_cols},
-               {measurement_cols},
-               {procedure_cols}
-        FROM no_outcome_patients n
-        JOIN person p ON n.person_id = p.person_id
-        LEFT JOIN exposure_features d ON n.person_id = d.person_id
-        LEFT JOIN measurement_features m ON n.person_id = m.person_id
-        LEFT JOIN procedure_features proc ON n.person_id = proc.person_id
-        GROUP BY n.person_id, observation_period_end_date, p.gender_concept_id, p.race_concept_id, p.year_of_birth
-    )
-    SELECT * FROM final_features;
-    """
-    return query
 
 # Helper function to map concept_ids to concept names from the concept table
 def map_concept_ids_to_names2(con, concept_ids: List[int],dialect, source_schema = "main") -> dict:
@@ -553,8 +752,6 @@ def map_all_feature_ids(con, df,dialect='duckdb', source_schema = "main"):
     # Fetch names from concept table
     return map_concept_ids_to_names2(con, list(concept_ids),dialect, source_schema)
 
-
-import pandas as pd
 
 def rename_columns_using_concept_names(df, concept_map: dict) -> pd.DataFrame:
     new_columns = {}
@@ -618,7 +815,7 @@ def get_top_concepts_from_predefined_outcomes(
         FROM drug_era d
         JOIN outcome_patients o ON d.person_id = o.person_id
         WHERE d.drug_era_end_date >= (o.condition_start_date - INTERVAL {time_window_days} DAY)
-          AND d.drug_era_start_date <= o.condition_start_date
+          AND d.drug_era_start_date < o.condition_start_date
         GROUP BY d.drug_concept_id
         ORDER BY freq DESC
         LIMIT {num_exposures}
@@ -648,36 +845,363 @@ def get_top_concepts_from_predefined_outcomes(
 
     return top_exposures, top_measurements, top_procedures
 
+
+# def build_negative_patient_query_random_window(
+#     top_exposures: Optional[List[int]] = None,
+#     top_measurements: Optional[List[int]] = None,
+#     top_procedures: Optional[List[int]] = None,
+#     extra_conditions: Optional[List[int]] = None,
+#     outcome_id: Union[int, str] = -1,  # 'predefined' or an int
+#     time_window_days: int = 365,
+#     source_schema: str = 'main',
+#     result_schema: str = 'main',
+#     dialect: str = 'duckdb',
+#     seed: int = 42,
+# ) -> str:
+#     """
+#     Build a SQL query to extract negative patient examples with a
+#     deterministic pseudo-random index date per person.
+
+#     The index_date is stable across runs for the same person_id + seed.
+#     """
+
+#     # Optionally remove creatinine as a measurement feature in threshold mode
+#     CREATININE_CONCEPT_ID = 3016723
+#     if outcome_id == 'predefined' and top_measurements:
+#         top_measurements = [cid for cid in top_measurements if cid != CREATININE_CONCEPT_ID]
+
+#     feature_ctes: List[str] = []
+#     feature_selects: List[str] = []
+#     joins: List[str] = []
+
+#     # Exposure features
+#     if top_exposures:
+#         feature_ctes.append(f"""
+#         exposure_features AS (
+#             SELECT d.person_id, d.drug_concept_id
+#             FROM {source_schema}.drug_era d
+#             JOIN random_anchors n ON d.person_id = n.person_id
+#             WHERE d.drug_concept_id IN ({','.join(map(str, top_exposures))})
+#               AND d.drug_era_end_date >= n.index_date - INTERVAL {time_window_days} DAY
+#               AND d.drug_era_start_date <  n.index_date
+#         )
+#         """)
+#         feature_selects.extend([
+#             f"MAX(CASE WHEN d.drug_concept_id = {cid} THEN 1 ELSE 0 END) AS exposure_{cid}"
+#             for cid in top_exposures
+#         ])
+#         joins.append("LEFT JOIN exposure_features d ON n.person_id = d.person_id")
+
+#     # Measurement features
+#     if top_measurements:
+#         feature_ctes.append(f"""
+#         measurement_features AS (
+#             SELECT
+#                 m.person_id,
+#                 m.measurement_concept_id,
+#                 m.value_as_number,
+#                 n.index_date,
+#                 ROW_NUMBER() OVER (
+#                     PARTITION BY m.person_id, m.measurement_concept_id
+#                     ORDER BY m.measurement_date DESC
+#                 ) AS rn
+#             FROM {source_schema}.measurement m
+#             JOIN random_anchors n ON m.person_id = n.person_id
+#             WHERE m.measurement_concept_id IN ({','.join(map(str, top_measurements))})
+#               AND m.measurement_date >= n.index_date - INTERVAL {time_window_days} DAY
+#               AND m.measurement_date <  n.index_date
+#         )
+#         """)
+#         feature_selects.extend([
+#             f"MAX(CASE WHEN m.measurement_concept_id = {cid} AND m.rn = 1 "
+#             f"THEN m.value_as_number ELSE NULL END) AS measurement_{cid}"
+#             for cid in top_measurements
+#         ])
+#         joins.append("LEFT JOIN measurement_features m ON n.person_id = m.person_id")
+
+#     # Procedure features
+#     if top_procedures:
+#         feature_ctes.append(f"""
+#         procedure_features AS (
+#             SELECT proc.person_id, proc.procedure_concept_id
+#             FROM {source_schema}.procedure_occurrence proc
+#             JOIN random_anchors n ON proc.person_id = n.person_id
+#             WHERE proc.procedure_concept_id IN ({','.join(map(str, top_procedures))})
+#               AND proc.procedure_date >= n.index_date - INTERVAL {time_window_days} DAY
+#               AND proc.procedure_date <  n.index_date
+#         )
+#         """)
+#         feature_selects.extend([
+#             f"MAX(CASE WHEN proc.procedure_concept_id = {cid} THEN 1 ELSE 0 END) AS procedure_{cid}"
+#             for cid in top_procedures
+#         ])
+#         joins.append("LEFT JOIN procedure_features proc ON n.person_id = proc.person_id")
+
+#     # Extra condition features
+#     if extra_conditions:
+#         feature_ctes.append(f"""
+#         condition_features AS (
+#             SELECT c.person_id, c.condition_concept_id
+#             FROM {source_schema}.condition_occurrence c
+#             JOIN random_anchors n ON c.person_id = n.person_id
+#             WHERE c.condition_concept_id IN ({','.join(map(str, extra_conditions))})
+#               AND c.condition_start_date >= n.index_date - INTERVAL {time_window_days} DAY
+#               AND c.condition_start_date <  n.index_date
+#         )
+#         """)
+#         feature_selects.extend([
+#             f"MAX(CASE WHEN cf.condition_concept_id = {cid} THEN 1 ELSE 0 END) AS condition_{cid}"
+#             for cid in extra_conditions
+#         ])
+#         joins.append("LEFT JOIN condition_features cf ON n.person_id = cf.person_id")
+
+#     # Base select clause
+#     select_clause = f"""
+#         n.person_id,
+#         n.index_date AS condition_start_date,
+#         0 AS condition_concept_id,
+#         p.gender_concept_id,
+#         p.race_concept_id,
+#         YEAR(n.index_date) - p.year_of_birth AS age_at_outcome
+#         {',' if feature_selects else ''}{', '.join(feature_selects)}
+#     """
+
+#     # Deterministic pseudo-random fraction in [0,1) without integer overflow:
+#     # hash( CAST(person_id AS VARCHAR) || '_' || CAST(seed AS VARCHAR) )
+#     frac_expr = f"""
+#       (
+#         (ABS(hash(CAST(person_id AS VARCHAR) || '_' || CAST({seed} AS VARCHAR))) % 1000000)
+#         / 1000000.0
+#       )
+#     """
+
+#     # Base cohort and deterministic anchor dates
+#     if outcome_id == 'predefined':
+#         base_ctes = f"""
+#         negative_cohort AS (
+#             SELECT person_id,
+#                    observation_period_start_date,
+#                    observation_period_end_date,
+#                    DATE_DIFF('day', observation_period_start_date, observation_period_end_date) AS duration_days
+#             FROM {source_schema}.observation_period
+#             WHERE person_id IN (SELECT person_id FROM {result_schema}.negative_outcome_patients)
+#               AND DATE_DIFF('day', observation_period_start_date, observation_period_end_date) >= {time_window_days}
+#         ),
+#         random_anchors AS (
+#             SELECT *,
+#                    observation_period_start_date
+#                    + CAST(
+#                        FLOOR(
+#                          {frac_expr} * GREATEST(duration_days - {time_window_days}, 0)
+#                        ) AS INTEGER
+#                      ) * INTERVAL 1 DAY
+#                    AS index_date
+#             FROM negative_cohort
+#         )
+#         """
+#     else:
+#         base_ctes = f"""
+#         eligible_patients AS (
+#             SELECT person_id,
+#                    observation_period_start_date,
+#                    observation_period_end_date,
+#                    DATE_DIFF('day', observation_period_start_date, observation_period_end_date) AS duration_days
+#             FROM {source_schema}.observation_period
+#             WHERE DATE_DIFF('day', observation_period_start_date, observation_period_end_date) >= {time_window_days}
+#         ),
+#         negative_cohort AS (
+#             SELECT e.*
+#             FROM eligible_patients e
+#             LEFT JOIN {source_schema}.condition_occurrence c
+#               ON e.person_id = c.person_id AND c.condition_concept_id = {outcome_id}
+#             WHERE c.person_id IS NULL
+#         ),
+#         random_anchors AS (
+#             SELECT *,
+#                    observation_period_start_date
+#                    + CAST(
+#                        FLOOR(
+#                          {frac_expr} * GREATEST(duration_days - {time_window_days}, 0)
+#                        ) AS INTEGER
+#                      ) * INTERVAL 1 DAY
+#                    AS index_date
+#             FROM negative_cohort
+#         )
+#         """
+
+#     # Assemble WITH clause
+#     with_clause = base_ctes
+#     if feature_ctes:
+#         with_clause += ",\n" + ",\n".join(feature_ctes)
+
+#     with_clause += f""",
+#     final_features AS (
+#         SELECT
+#             {select_clause}
+#         FROM random_anchors n
+#         JOIN {source_schema}.person p ON n.person_id = p.person_id
+#         {' '.join(joins)}
+#         GROUP BY n.person_id, n.index_date, p.gender_concept_id, p.race_concept_id, p.year_of_birth
+#     )
+#     """
+
+#     query = f"""
+#     WITH
+#     {with_clause}
+#     SELECT *, 0 AS label FROM final_features;
+#     """
+
+#     sql = qualify_tables(query, source_schema=source_schema)
+#     sql = translate_sql(sql, dialect=dialect)
+#     return sql
+
+# the above commented out function is the old version. 
+# The new version below adds 4 dense burden features and ensures all joins are on both person_id 
+# and condition_start_date to prevent leakage.
 def build_negative_patient_query_random_window(
     top_exposures: Optional[List[int]] = None,
     top_measurements: Optional[List[int]] = None,
     top_procedures: Optional[List[int]] = None,
     extra_conditions: Optional[List[int]] = None,
-    outcome_id: Union[int, str] = -1,  # 'predefined' or an int
+    outcome_id: Union[int, str] = -1,  # "predefined" or an int
     time_window_days: int = 365,
-    source_schema: str = 'main',
-    result_schema: str = 'main',
-    dialect: str = 'duckdb',
+    source_schema: str = "main",
+    result_schema: str = "main",
+    dialect: str = "duckdb",
+    seed: int = 42,
 ) -> str:
     """
-    Build a SQL query to extract negative patient examples with a random index date.
-    If outcome_id == 'predefined', uses the predefined table `negative_outcome_patients` as source.
-    Otherwise, excludes patients with the given condition_concept_id.
+    NEGATIVES:
+    - Uses a deterministic pseudo-random anchor date per person (index_date).
+    - In threshold mode (outcome_id='predefined'), negative persons come from result_schema.negative_outcome_patients.
+    - Adds the same 4 dense burden features:
+        visit_count, distinct_drug_count, distinct_condition_count, days_observed_before_index
     """
 
-    feature_ctes = []
-    feature_selects = []
-    joins = []
+    # Prevent leakage in threshold mode (predefined outcome built from creatinine)
+    CREATININE_CONCEPT_ID = 3016723
+    if outcome_id == "predefined" and top_measurements:
+        top_measurements = [cid for cid in top_measurements if cid != CREATININE_CONCEPT_ID]
 
-    # Exposure features
+    # Deterministic pseudo-random fraction in [0,1)
+    frac_expr = f"""
+      (
+        (ABS(hash(CAST(person_id AS VARCHAR) || '_' || CAST({seed} AS VARCHAR))) % 1000000)
+        / 1000000.0
+      )
+    """
+
+    # Base cohort and random anchors
+    if outcome_id == "predefined":
+        base_ctes = f"""
+        negative_cohort AS (
+            SELECT
+                person_id,
+                observation_period_start_date,
+                observation_period_end_date,
+                DATE_DIFF('day', observation_period_start_date, observation_period_end_date) AS duration_days
+            FROM {source_schema}.observation_period
+            WHERE person_id IN (SELECT person_id FROM {result_schema}.negative_outcome_patients)
+              AND DATE_DIFF('day', observation_period_start_date, observation_period_end_date) >= {time_window_days}
+        ),
+        random_anchors AS (
+            SELECT *,
+                   observation_period_start_date
+                   + CAST(
+                       FLOOR(
+                         {frac_expr} * GREATEST(duration_days - {time_window_days}, 0)
+                       ) AS INTEGER
+                     ) * INTERVAL 1 DAY
+                   AS index_date
+            FROM negative_cohort
+        )
+        """
+    else:
+        base_ctes = f"""
+        eligible_patients AS (
+            SELECT
+                person_id,
+                observation_period_start_date,
+                observation_period_end_date,
+                DATE_DIFF('day', observation_period_start_date, observation_period_end_date) AS duration_days
+            FROM {source_schema}.observation_period
+            WHERE DATE_DIFF('day', observation_period_start_date, observation_period_end_date) >= {time_window_days}
+        ),
+        negative_cohort AS (
+            SELECT e.*
+            FROM eligible_patients e
+            LEFT JOIN {source_schema}.condition_occurrence c
+              ON e.person_id = c.person_id AND c.condition_concept_id = {int(outcome_id)}
+            WHERE c.person_id IS NULL
+        ),
+        random_anchors AS (
+            SELECT *,
+                   observation_period_start_date
+                   + CAST(
+                       FLOOR(
+                         {frac_expr} * GREATEST(duration_days - {time_window_days}, 0)
+                       ) AS INTEGER
+                     ) * INTERVAL 1 DAY
+                   AS index_date
+            FROM negative_cohort
+        )
+        """
+
+    feature_ctes: List[str] = []
+    feature_selects: List[str] = []
+    joins: List[str] = []
+
+    # 4 dense burden features (anchored on random_anchors.index_date)
+    feature_ctes.append(f"""
+    burden_features AS (
+        SELECT
+            n.person_id,
+            n.index_date,
+            COUNT(DISTINCT v.visit_occurrence_id) AS visit_count,
+            COUNT(DISTINCT d.drug_concept_id) AS distinct_drug_count,
+            COUNT(DISTINCT c.condition_concept_id) AS distinct_condition_count
+        FROM random_anchors n
+        LEFT JOIN {source_schema}.visit_occurrence v
+          ON v.person_id = n.person_id
+         AND v.visit_start_date >= (n.index_date - INTERVAL {time_window_days} DAY)
+         AND v.visit_start_date <  n.index_date
+        LEFT JOIN {source_schema}.drug_era d
+          ON d.person_id = n.person_id
+         AND d.drug_era_end_date >= (n.index_date - INTERVAL {time_window_days} DAY)
+         AND d.drug_era_start_date <  n.index_date
+        LEFT JOIN {source_schema}.condition_occurrence c
+          ON c.person_id = n.person_id
+         AND c.condition_start_date >= (n.index_date - INTERVAL {time_window_days} DAY)
+         AND c.condition_start_date <  n.index_date
+        GROUP BY n.person_id, n.index_date
+    )
+    """)
+
+    feature_ctes.append(f"""
+    observation_depth AS (
+        SELECT
+            n.person_id,
+            n.index_date,
+            MAX(DATE_DIFF('day', op.observation_period_start_date, n.index_date)) AS days_observed_before_index
+        FROM random_anchors n
+        LEFT JOIN {source_schema}.observation_period op
+          ON op.person_id = n.person_id
+         AND n.index_date BETWEEN op.observation_period_start_date AND op.observation_period_end_date
+        GROUP BY n.person_id, n.index_date
+    )
+    """)
+
+    # Exposure features (binary)
     if top_exposures:
         feature_ctes.append(f"""
         exposure_features AS (
             SELECT d.person_id, d.drug_concept_id
             FROM {source_schema}.drug_era d
-            JOIN random_anchors n ON d.person_id = n.person_id
-            WHERE d.drug_concept_id IN ({','.join(map(str, top_exposures))})
-              AND d.drug_era_start_date BETWEEN n.index_date - INTERVAL {time_window_days} DAY AND n.index_date
+            JOIN random_anchors n
+              ON d.person_id = n.person_id
+            WHERE d.drug_concept_id IN ({",".join(map(str, top_exposures))})
+              AND d.drug_era_end_date >= n.index_date - INTERVAL {time_window_days} DAY
+              AND d.drug_era_start_date <  n.index_date
         )
         """)
         feature_selects.extend([
@@ -686,36 +1210,45 @@ def build_negative_patient_query_random_window(
         ])
         joins.append("LEFT JOIN exposure_features d ON n.person_id = d.person_id")
 
-    # Measurement features
+    # Measurement features (continuous: latest value pre-index)
     if top_measurements:
         feature_ctes.append(f"""
         measurement_features AS (
-            SELECT m.person_id, m.measurement_concept_id, m.value_as_number, n.index_date,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY m.person_id, m.measurement_concept_id
-                       ORDER BY ABS(DATE_DIFF('day', m.measurement_date, n.index_date))
-                   ) AS rn
+            SELECT
+                m.person_id,
+                m.measurement_concept_id,
+                m.value_as_number,
+                n.index_date,
+                ROW_NUMBER() OVER (
+                    PARTITION BY m.person_id, m.measurement_concept_id
+                    ORDER BY m.measurement_date DESC
+                ) AS rn
             FROM {source_schema}.measurement m
-            JOIN random_anchors n ON m.person_id = n.person_id
-            WHERE m.measurement_concept_id IN ({','.join(map(str, top_measurements))})
-              AND m.measurement_date BETWEEN n.index_date - INTERVAL {time_window_days} DAY AND n.index_date
+            JOIN random_anchors n
+              ON m.person_id = n.person_id
+            WHERE m.measurement_concept_id IN ({",".join(map(str, top_measurements))})
+              AND m.measurement_date >= n.index_date - INTERVAL {time_window_days} DAY
+              AND m.measurement_date <  n.index_date
         )
         """)
         feature_selects.extend([
-            f"MAX(CASE WHEN m.measurement_concept_id = {cid} AND m.rn = 1 THEN m.value_as_number ELSE NULL END) AS measurement_{cid}"
+            f"MAX(CASE WHEN m.measurement_concept_id = {cid} AND m.rn = 1 "
+            f"THEN m.value_as_number ELSE NULL END) AS measurement_{cid}"
             for cid in top_measurements
         ])
         joins.append("LEFT JOIN measurement_features m ON n.person_id = m.person_id")
 
-    # Procedure features
+    # Procedure features (binary)
     if top_procedures:
         feature_ctes.append(f"""
         procedure_features AS (
             SELECT proc.person_id, proc.procedure_concept_id
             FROM {source_schema}.procedure_occurrence proc
-            JOIN random_anchors n ON proc.person_id = n.person_id
-            WHERE proc.procedure_concept_id IN ({','.join(map(str, top_procedures))})
-              AND proc.procedure_date BETWEEN n.index_date - INTERVAL {time_window_days} DAY AND n.index_date
+            JOIN random_anchors n
+              ON proc.person_id = n.person_id
+            WHERE proc.procedure_concept_id IN ({",".join(map(str, top_procedures))})
+              AND proc.procedure_date >= n.index_date - INTERVAL {time_window_days} DAY
+              AND proc.procedure_date <  n.index_date
         )
         """)
         feature_selects.extend([
@@ -724,15 +1257,17 @@ def build_negative_patient_query_random_window(
         ])
         joins.append("LEFT JOIN procedure_features proc ON n.person_id = proc.person_id")
 
-    # Extra condition features
+    # Extra condition features (binary)
     if extra_conditions:
         feature_ctes.append(f"""
         condition_features AS (
             SELECT c.person_id, c.condition_concept_id
             FROM {source_schema}.condition_occurrence c
-            JOIN random_anchors n ON c.person_id = n.person_id
-            WHERE c.condition_concept_id IN ({','.join(map(str, extra_conditions))})
-              AND c.condition_start_date BETWEEN n.index_date - INTERVAL {time_window_days} DAY AND n.index_date
+            JOIN random_anchors n
+              ON c.person_id = n.person_id
+            WHERE c.condition_concept_id IN ({",".join(map(str, extra_conditions))})
+              AND c.condition_start_date >= n.index_date - INTERVAL {time_window_days} DAY
+              AND c.condition_start_date <  n.index_date
         )
         """)
         feature_selects.extend([
@@ -741,63 +1276,21 @@ def build_negative_patient_query_random_window(
         ])
         joins.append("LEFT JOIN condition_features cf ON n.person_id = cf.person_id")
 
-    # Select clause
     select_clause = f"""
         n.person_id,
         n.index_date AS condition_start_date,
         0 AS condition_concept_id,
         p.gender_concept_id,
         p.race_concept_id,
-        YEAR(n.index_date) - p.year_of_birth AS age_at_outcome
-        {',' if feature_selects else ''}{', '.join(feature_selects)}
+        YEAR(n.index_date) - p.year_of_birth AS age_at_outcome,
+
+        COALESCE(b.visit_count, 0) AS visit_count,
+        COALESCE(b.distinct_drug_count, 0) AS distinct_drug_count,
+        COALESCE(b.distinct_condition_count, 0) AS distinct_condition_count,
+        COALESCE(od.days_observed_before_index, 0) AS days_observed_before_index
+        {"," if feature_selects else ""}{", ".join(feature_selects)}
     """
 
-    # Base cohort logic
-    if outcome_id == 'predefined':
-        base_ctes = f"""
-        negative_cohort AS (
-            SELECT person_id,
-                   observation_period_start_date,
-                   observation_period_end_date,
-                   DATE_DIFF('day', observation_period_start_date, observation_period_end_date) AS duration_days
-            FROM {source_schema}.observation_period
-            WHERE person_id IN (SELECT person_id FROM {result_schema}.negative_outcome_patients)
-              AND DATE_DIFF('day', observation_period_start_date, observation_period_end_date) >= {time_window_days}
-        ),
-        random_anchors AS (
-            SELECT *,
-                   observation_period_start_date
-                   + (CAST(FLOOR(RANDOM() * GREATEST(duration_days - {time_window_days}, 0)) AS INTEGER)) * INTERVAL 1 DAY
-                   AS index_date
-            FROM negative_cohort
-        )
-        """
-    else:
-        base_ctes = f"""
-        eligible_patients AS (
-            SELECT person_id,
-                   observation_period_start_date,
-                   observation_period_end_date,
-                   DATE_DIFF('day', observation_period_start_date, observation_period_end_date) AS duration_days
-            FROM {source_schema}.observation_period
-            WHERE DATE_DIFF('day', observation_period_start_date, observation_period_end_date) >= {time_window_days}
-        ),
-        negative_cohort AS (
-            SELECT e.*
-            FROM eligible_patients e
-            LEFT JOIN condition_occurrence c ON e.person_id = c.person_id AND c.condition_concept_id = {outcome_id}
-            WHERE c.person_id IS NULL
-        ),
-        random_anchors AS (
-            SELECT *,
-                   observation_period_start_date
-                   + (CAST(FLOOR(RANDOM() * GREATEST(duration_days - {time_window_days}, 0)) AS INTEGER)) * INTERVAL 1 DAY
-                   AS index_date
-            FROM negative_cohort
-        )
-        """
-
-    # Final assembly
     with_clause = base_ctes
     if feature_ctes:
         with_clause += ",\n" + ",\n".join(feature_ctes)
@@ -807,17 +1300,24 @@ def build_negative_patient_query_random_window(
         SELECT
             {select_clause}
         FROM random_anchors n
-        JOIN person p ON n.person_id = p.person_id
-        {' '.join(joins)}
-        GROUP BY n.person_id, n.index_date, p.gender_concept_id, p.race_concept_id, p.year_of_birth
+        JOIN {source_schema}.person p
+          ON n.person_id = p.person_id
+
+        LEFT JOIN burden_features b
+          ON n.person_id = b.person_id AND n.index_date = b.index_date
+        LEFT JOIN observation_depth od
+          ON n.person_id = od.person_id AND n.index_date = od.index_date
+
+        {" ".join(joins)}
+        GROUP BY
+            n.person_id, n.index_date,
+            p.gender_concept_id, p.race_concept_id, p.year_of_birth,
+            b.visit_count, b.distinct_drug_count, b.distinct_condition_count,
+            od.days_observed_before_index
     )
     """
 
-    query = f"""
-    WITH
-    {with_clause}
-    SELECT *, 0 AS label FROM final_features;
-    """
+    query = f"WITH {with_clause} SELECT *, 0 AS label FROM final_features;"
     sql = qualify_tables(query, source_schema=source_schema)
     sql = translate_sql(sql, dialect=dialect)
     return sql
