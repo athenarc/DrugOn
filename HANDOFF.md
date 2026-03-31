@@ -9,13 +9,13 @@ There are two main workstreams:
 1. Dataset construction from OMOP tables in DuckDB/Postgres
 2. Model training, comparison, explainability, and evaluation on the generated datasets
 
-The production code lives mainly in:
+The code lives mainly in:
 
 - `features/`
 - `scripts/`
 - `evaluation/`
 
-The `notebooks/` folder is exploratory and contains research/prototyping work around graph discovery, causal analysis, MIMIC experiments, and manual feature analysis.
+The `notebooks/` folder is exploratory and contains research/prototyping work around graph discovery and causal analysis.
 
 ## Repository Map
 
@@ -124,7 +124,7 @@ This is the script that turns OMOP data into a training table with a `label` col
 It supports two modes:
 
 1. Threshold mode
-   The outcome is defined as creatinine above a threshold.
+   The outcome is defined as creatinine above a threshold. The id of creatinine is hardcoded inside the code at `run_threshold_mode()` function, so if you want to run an experiment based on a new measurement this has to change. 
 
 2. Known outcome mode
    The outcome is an explicit `condition_concept_id`.
@@ -282,8 +282,6 @@ Observed themes:
 - `graph_effects.ipynb`
   Graph/effect exploration built around causal discovery tooling.
 
-- `mimic.ipynb`
-  MIMIC-oriented data analysis and feature experiments.
 
 The CSV files in `notebooks/` look like exported intermediate results for graph/effect analysis.
 
