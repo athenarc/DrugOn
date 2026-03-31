@@ -283,7 +283,7 @@ Observed themes:
   Graph/effect exploration built around causal discovery tooling.
 
 
-The CSV files in `notebooks/` look like exported intermediate results for graph/effect analysis.
+You can run the notebooks using the CSV files extracted from the `build_refrence_set.py` script.
 
 ### `data/`
 
